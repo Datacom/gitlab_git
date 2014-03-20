@@ -182,6 +182,18 @@ module Gitlab
         end
       end
 
+      def search_files_advanced(query, ref = nil)
+        if ref.nil? || ref == ""
+          ref = root_ref
+        end
+
+        greps = grit.advanced_grep(query, 3, ref)
+
+        greps.map do |grep|
+          Gitlab::Git::BlobSnippet.new(ref, grep.content, grep.startline, grep.filename)
+        end
+      end
+
       # Delegate log to Grit method
       #
       # Usage.
