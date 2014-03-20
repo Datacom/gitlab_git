@@ -253,6 +253,18 @@ module Gitlab
         greps
       end
 
+      def search_files_advanced(query, ref = nil)
+        if ref.nil? || ref == ""
+          ref = root_ref
+        end
+
+        greps = grit.advanced_grep(query, 3, ref)
+
+        greps.map do |grep|
+          Gitlab::Git::BlobSnippet.new(ref, grep.content, grep.startline, grep.filename)
+        end
+      end
+
       # Use the Rugged Walker API to build an array of commits.
       #
       # Usage.
