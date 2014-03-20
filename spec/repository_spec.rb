@@ -154,6 +154,25 @@ describe Gitlab::Git::Repository do
     end
   end
 
+  # Because advanced_grep is reasonably well-tested, we won't repeat that here but rather just check that
+  # it works at all
+  describe :search_files_advanced do
+    let(:results) { repository.search_files_advanced('rails', 'master') }
+    subject { results }
+
+    it { should be_kind_of Array }
+    its(:first) { should be_kind_of Gitlab::Git::BlobSnippet }
+
+    context 'blob result' do
+      subject { results.first }
+
+      its(:ref) { should == 'master' }
+      its(:filename) { should == '.travis.yml' }
+      its(:startline) { should == 6 }
+      its(:data) { should include "bundle exec rake db:seed_fu RAILS_ENV=test" }
+    end
+  end
+
   context :submodules do
     let(:repository) { Gitlab::Git::Repository.new(TEST_SUB_REPO_PATH) }
     let(:submodules) { repository.submodules('898ce92b0e0b5ade8a7ef7e3c779dda476b3eef8') }
