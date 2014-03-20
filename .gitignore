@@ -3,3 +3,6 @@ support/*
 tmp/*
 coverage/*
 .DS_Store
+
+.idea
+*.iml
