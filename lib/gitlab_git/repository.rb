@@ -1,5 +1,6 @@
 # Gitlab::Git::Repository is a wrapper around native Rugged::Repository object
 require_relative 'encoding_helper'
+require_relative 'path_helper'
 require 'tempfile'
 require "rubygems/package"
 
@@ -12,6 +13,7 @@ module Gitlab
 
       class NoRepository < StandardError; end
       class InvalidBlobName < StandardError; end
+      class InvalidRef < StandardError; end
 
       # Default branch in the repository
       attr_accessor :root_ref
@@ -136,73 +138,24 @@ module Gitlab
         nil
       end
 
-      # Archive Project to .tar.gz
-      #
-      # Already packed repo archives stored at
-      # app_root/tmp/repositories/<project_name>.git/<project_name>-<ref>-<commit id>.tar.gz
-      #
-      def archive_repo(ref, storage_path, format = "tar.gz")
-        ref ||= root_ref
-
-        file_path = archive_file_path(ref, storage_path, format)
-        return nil unless file_path
-
-        return file_path if File.exist?(file_path)
-
-        case format
-        when "tar.bz2", "tbz", "tbz2", "tb2", "bz2"
-          compress_cmd = %W(bzip2)
-        when "tar"
-          compress_cmd = %W(cat)
-        when "zip"
-          git_archive_format = "zip"
-          compress_cmd = %W(cat)
-        else
-          # everything else should fall back to tar.gz
-          compress_cmd = %W(gzip -n)
-        end
-
-        FileUtils.mkdir_p File.dirname(file_path)
-
-        pid_file_path = archive_pid_file_path(ref, storage_path, format)
-        return file_path if File.exist?(pid_file_path)
-
-        File.open(pid_file_path, "w") do |file|
-          file.puts Process.pid
-        end
-
-        # Create the archive in temp file, to avoid leaving a corrupt archive
-        # to be downloaded by the next user if we get interrupted while
-        # creating the archive.
-        temp_file_path = "#{file_path}.#{Process.pid}-#{Time.now.to_i}"
-
-        begin
-          archive_to_file(ref, temp_file_path, git_archive_format, compress_cmd)
-        rescue
-          FileUtils.rm(temp_file_path)
-          raise
-        ensure
-          FileUtils.rm(pid_file_path)
-        end
-
-        # move temp file to persisted location
-        FileUtils.move(temp_file_path, file_path)
-
-        file_path
-      end
-
-      def archive_name(ref)
+      def archive_metadata(ref, storage_path, format = "tar.gz")
         ref ||= root_ref
         commit = Gitlab::Git::Commit.find(self, ref)
-        return nil unless commit
+        return {} if commit.nil?
 
-        project_name = self.name.sub(/\.git\z/, "")
-        file_name = "#{project_name}-#{ref}-#{commit.id}"
+        project_name = self.name.chomp('.git')
+        prefix = "#{project_name}-#{ref}-#{commit.id}"
+
+        {
+          'RepoPath' => path,
+          'ArchivePrefix' => prefix,
+          'ArchivePath' => archive_file_path(prefix, storage_path, format),
+          'CommitId' => commit.id,
+        }
       end
 
-      def archive_file_path(ref, storage_path, format = "tar.gz")
+      def archive_file_path(name, storage_path, format = "tar.gz")
         # Build file path
-        name = archive_name(ref)
         return nil unless name
 
         extension =
@@ -220,10 +173,6 @@ module Gitlab
 
         file_name = "#{name}.#{extension}"
         File.join(storage_path, self.name, file_name)
-      end
-
-      def archive_pid_file_path(*args)
-        "#{archive_file_path(*args)}.pid"
       end
 
       # Return repo size in megabytes
@@ -251,18 +200,6 @@ module Gitlab
         end
 
         greps
-      end
-
-      def search_files_advanced(query, ref = nil)
-        if ref.nil? || ref == ""
-          ref = root_ref
-        end
-
-        greps = grit.advanced_grep(query, 3, ref)
-
-        greps.map do |grep|
-          Gitlab::Git::BlobSnippet.new(ref, grep.content, grep.startline, grep.filename)
-        end
       end
 
       # Use the Rugged Walker API to build an array of commits.
@@ -305,7 +242,7 @@ module Gitlab
         cmd += %W(--follow) if options[:follow]
         cmd += %W(--no-merges) if options[:skip_merges]
         cmd += [sha]
-        cmd += %W(-- #{options[:path]}) if options[:path]
+        cmd += %W(-- #{options[:path]}) if options[:path].present?
 
         raw_output = IO.popen(cmd) {|io| io.read }
 
@@ -520,7 +457,8 @@ module Gitlab
       def commit_count(ref)
         walker = Rugged::Walker.new(rugged)
         walker.sorting(Rugged::SORT_TOPO | Rugged::SORT_REVERSE)
-        walker.push(ref)
+        oid = rugged.rev_parse_oid(ref)
+        walker.push(oid)
         walker.count
       end
 
@@ -708,13 +646,50 @@ module Gitlab
           rugged.branches.create(ref, start_point)
           options.delete(:b)
         end
-        default_options = { strategy: :safe_create }
+        default_options = { strategy: [:recreate_missing, :safe] }
         rugged.checkout(ref, default_options.merge(options))
       end
 
       # Delete the specified branch from the repository
       def delete_branch(branch_name)
         rugged.branches.delete(branch_name)
+      end
+
+      # Create a new branch named **ref+ based on **stat_point+, HEAD by default
+      #
+      # Examples:
+      #   create_branch("feature")
+      #   create_branch("other-feature", "master")
+      def create_branch(ref, start_point = "HEAD")
+        rugged_ref = rugged.branches.create(ref, start_point)
+        Branch.new(rugged_ref.name, rugged_ref.target)
+      rescue Rugged::ReferenceError => e
+        raise InvalidRef.new("Branch #{ref} already exists") if e.to_s =~ /'refs\/heads\/#{ref}'/
+        raise InvalidRef.new("Invalid reference #{start_point}")
+      end
+
+      # Add a tag with +tag_name++ name to the repository in corresponding +ref_target++
+      # supports passing a hash of options to create an annotated tag
+      #
+      # Valid annotation options are:
+      #   :tagger ::
+      #     same structure as a committer, the user that is creating the tag
+      #
+      #   :message ::
+      #     the message to include in the tag annotation
+      #
+      # Returns a Gitlab::Git::Tag
+      def add_tag(tag_name, ref_target, options = nil)
+        tag = rugged.tags.create(tag_name, ref_target, options)
+        if tag.annotated?
+          Tag.new(tag_name, ref_target, tag.annotation.message)
+        else
+          Tag.new(tag_name, ref_target)
+        end
+      rescue Rugged::TagError
+        raise InvalidRef.new("Tag #{tag_name} already exists")
+      rescue Rugged::ReferenceError
+        raise InvalidRef.new("Target #{ref_target} is invalid")
       end
 
       # Return an array of this repository's remote names
@@ -738,9 +713,7 @@ module Gitlab
       # repo.update_remote("origin", url: "path/to/repo")
       def remote_update(remote_name, options = {})
         # TODO: Implement other remote options
-        remote = rugged.remotes[remote_name]
-        remote.url = options[:url] if options[:url]
-        remote.save
+        rugged.remotes.set_url(remote_name, options[:url]) if options[:url]
       end
 
       # Fetch the specified remote
@@ -817,6 +790,84 @@ module Gitlab
 
       def autocrlf=(value)
         rugged.config['core.autocrlf'] = AUTOCRLF_VALUES.invert[value]
+      end
+
+      # Create a new directory with a .gitkeep file. Creates
+      # all required nested directories (i.e. mkdir -p behavior)
+      #
+      # options should contain next structure:
+      #   author: {
+      #     email: 'user@example.com',
+      #     name: 'Test User',
+      #     time: Time.now
+      #   },
+      #   committer: {
+      #     email: 'user@example.com',
+      #     name: 'Test User',
+      #     time: Time.now
+      #   },
+      #   commit: {
+      #     message: 'Wow such commit',
+      #     branch: 'master'
+      #   }
+      def mkdir(path, options = {})
+        # Check if this directory exists; if it does, then don't bother
+        # adding .gitkeep file.
+        ref = options[:commit][:branch]
+        path = PathHelper.normalize_path(path).to_s
+        rugged_ref = rugged.ref(ref)
+
+        raise InvalidRef.new("Invalid ref") if rugged_ref.nil?
+        target_commit = rugged_ref.target
+        raise InvalidRef.new("Invalid target commit") if target_commit.nil?
+
+        entry = tree_entry(target_commit, path)
+        if entry
+          if entry[:type] == :blob
+            raise InvalidBlobName.new("Directory already exists as a file")
+          else
+            raise InvalidBlobName.new("Directory already exists")
+          end
+        end
+
+        options[:file] = {
+          content: '',
+          path: "#{path}/.gitkeep",
+          update: true
+        }
+
+        Blob.commit(self, options)
+      end
+
+      # Returns result like "git ls-files" , recursive and full file path
+      #
+      # Ex.
+      #   repo.ls_files('master')
+      #
+      def ls_files(ref)
+        actual_ref = ref || root_ref
+
+        begin
+          sha_from_ref(actual_ref)
+        rescue Rugged::OdbError, Rugged::InvalidError, Rugged::ReferenceError
+          # Return an empty array if the ref wasn't found
+          return []
+        end
+
+        cmd = %W(git --git-dir=#{path} ls-tree)
+        cmd += %w(-r)
+        cmd += %w(--full-tree)
+        cmd += %w(--full-name)
+        cmd += %W(-- #{actual_ref})
+
+        raw_output = IO.popen(cmd, &:read).split("\n").map do |f|
+          stuff, path = f.split("\t")
+          mode, type, sha = stuff.split(" ")
+          path if type == "blob"
+          # Contain only blob type
+        end
+
+        raw_output.compact
       end
 
       private
@@ -913,11 +964,15 @@ module Gitlab
       # Find the entry for +path+ in the tree for +commit+
       def tree_entry(commit, path)
         pathname = Pathname.new(path)
+        first = true
         tmp_entry = nil
 
         pathname.each_filename do |dir|
-          if tmp_entry.nil?
+          if first
             tmp_entry = commit.tree[dir]
+            first = false
+          elsif tmp_entry.nil?
+            return nil
           else
             tmp_entry = rugged.lookup(tmp_entry[:oid])
             return nil unless tmp_entry.type == :tree
@@ -969,16 +1024,14 @@ module Gitlab
 
           # Get the compression process ready to accept data from the read end
           # of the pipe
-          compress_pid = spawn(*compress_cmd, in: pipe_rd, out: file)
-          # Set the lowest priority for the compressing process
-          popen(nice_process(compress_pid), path)
+          compress_pid = spawn(*nice(compress_cmd), in: pipe_rd, out: file)
           # The read end belongs to the compression process now; we should
           # close our file descriptor for it.
           pipe_rd.close
 
           # Start 'git archive' and tell it to write into the write end of the
           # pipe.
-          git_archive_pid = spawn(*git_archive_cmd, out: pipe_wr)
+          git_archive_pid = spawn(*nice(git_archive_cmd), out: pipe_wr)
           # The write end belongs to 'git archive' now; close it.
           pipe_wr.close
 
@@ -991,14 +1044,12 @@ module Gitlab
         end
       end
 
-      def nice_process(pid)
-        niced_process = %W(renice -n 20 -p #{pid})
-
+      def nice(cmd)
+        nice_cmd = %W(nice -n 20)
         unless unsupported_platform?
-          niced_process = %W(ionice -c 2 -n 7 -p #{pid}) + niced_process
+          nice_cmd += %W(ionice -c 2 -n 7)
         end
-
-        niced_process
+        nice_cmd + cmd
       end
 
       def unsupported_platform?
